@@ -1,114 +1,230 @@
+import copy
 import json
-from pathlib import Path
-from datetime import date
+import random
+from datetime import date, timedelta
+from urllib.parse import quote, urlparse
+import xml.etree.ElementTree as ET
+
+import requests
 import streamlit as st
 
-st.set_page_config(page_title='ข้าวแกง 40', page_icon='🍛', layout='centered')
-DATA = Path('data/menus.json')
+st.set_page_config(page_title="ข้าวแกง 40 | เมนูหมุนเวียน", page_icon="🍛", layout="centered")
 DEFAULT = [
- {'name':'ผัดพริกแกงปลาดุก','category':'ผัด','ingredients':[],'steps':'','source':'สูตรของร้าน','url':''},
- {'name':'ต้มจืดหมูสับ','category':'ต้ม','ingredients':[],'steps':'','source':'สูตรของร้าน','url':''},
- {'name':'ผัดกะเพราหมูสับ','category':'ผัด','ingredients':[],'steps':'','source':'สูตรของร้าน','url':''},
- {'name':'ยำปลาทู','category':'ยำ','ingredients':[],'steps':'','source':'สูตรของร้าน','url':''},
- {'name':'แกงกะทิไก่กับยอดมะพร้าว','category':'แกง','ingredients':[],'steps':'','source':'สูตรของร้าน','url':''},
+    {"name":"ผัดพริกแกงปลาดุก","category":"ผัด","source":"สูตรของร้าน","url":"","steps":"","status":"ประจำร้าน"},
+    {"name":"ต้มจืดหมูสับ","category":"ต้ม","source":"สูตรของร้าน","url":"","steps":"","status":"ประจำร้าน"},
+    {"name":"ผัดกะเพราหมูสับ","category":"ผัด","source":"สูตรของร้าน","url":"","steps":"","status":"ประจำร้าน"},
+    {"name":"ยำปลาทู","category":"ยำ","source":"สูตรของร้าน","url":"","steps":"","status":"ประจำร้าน"},
+    {"name":"แกงกะทิไก่กับยอดมะพร้าว","category":"แกง","source":"สูตรของร้าน","url":"","steps":"","status":"ประจำร้าน"},
 ]
+CATEGORIES = ["ผัด","ต้ม","แกง","ยำ","ทอด","นึ่ง","อื่น ๆ"]
+STATUSES = ["ประจำร้าน","รอทดลอง","ขายดี","พักไว้"]
 
-def load():
-    if 'menus' not in st.session_state:
-        st.session_state.menus = json.loads(DATA.read_text(encoding='utf-8')) if DATA.exists() else DEFAULT
-    return st.session_state.menus
 
-def money(x): return f'{x:,.2f} บาท'
+def clean_url(url):
+    url = str(url or "").strip()
+    p = urlparse(url)
+    return url if p.scheme in ("http", "https") and p.netloc else ""
 
-def export_data():
-    return json.dumps(st.session_state.menus, ensure_ascii=False, indent=2).encode('utf-8')
 
-menus = load()
-st.title('🍛 ข้าวแกง 40')
-st.caption('จัดเมนู • เก็บสูตร • คำนวณต้นทุน | ราคาขายไม่เกิน 40 บาท')
-st.info('ข้อมูลที่แก้ไขอยู่ในเซสชันนี้ กรุณากด “ดาวน์โหลดสำรองข้อมูล” ก่อนปิดหรือรีสตาร์ตแอป และนำเข้าไฟล์เมื่อกลับมาใช้งาน')
-with st.expander('💾 สำรอง / นำเข้าข้อมูล'):
-    st.download_button('ดาวน์โหลดสำรองข้อมูล JSON', export_data(), file_name='khaokaeng40_backup.json', mime='application/json')
-    uploaded = st.file_uploader('นำเข้าไฟล์สำรอง JSON', type=['json'])
-    if uploaded and st.button('ยืนยันนำเข้าข้อมูล'):
+def normalized_menu(obj):
+    if not isinstance(obj, dict) or not str(obj.get("name", "")).strip():
+        return None
+    return {"name":str(obj["name"]).strip()[:120],
+            "category":str(obj.get("category", "อื่น ๆ"))[:40],
+            "source":str(obj.get("source", "ไม่ระบุ"))[:160],
+            "url":clean_url(obj.get("url", "")),
+            "steps":str(obj.get("steps", ""))[:10000],
+            "status":str(obj.get("status", "ประจำร้าน")) if obj.get("status") in STATUSES else "ประจำร้าน"}
+
+
+def migrate(obj):
+    # รองรับไฟล์สำรอง V1 ซึ่งเป็น list ของเมนู
+    if isinstance(obj, list):
+        menus = [normalized_menu(x) for x in obj]
+        return {"version":2,"menus":[x for x in menus if x],"plan":{}}
+    if not isinstance(obj, dict) or not isinstance(obj.get("menus"), list):
+        raise ValueError("ไฟล์ต้องเป็น JSON สำรองของข้าวแกง 40 V1 หรือ V2")
+    menus = [normalized_menu(x) for x in obj["menus"]]
+    menus = [x for x in menus if x]
+    if len(menus) > 2000:
+        raise ValueError("จำนวนเมนูมากเกินไป")
+    names = {x["name"] for x in menus}
+    raw_plan = obj.get("plan", {})
+    plan = {}
+    if isinstance(raw_plan, dict):
+        for k, v in raw_plan.items():
+            try:
+                date.fromisoformat(k)
+                if isinstance(v, list):
+                    plan[k] = list(dict.fromkeys(x for x in v if isinstance(x,str) and x in names))[:5]
+            except (ValueError, TypeError):
+                continue
+    return {"version":2,"menus":menus,"plan":plan}
+
+
+def state():
+    if "store" not in st.session_state:
+        st.session_state.store = {"version":2,"menus":copy.deepcopy(DEFAULT),"plan":{}}
+    return st.session_state.store
+
+
+def export_json():
+    return json.dumps(state(), ensure_ascii=False, indent=2).encode("utf-8")
+
+
+def add_menu(name, category, source, url, steps, status):
+    name = name.strip()
+    if not name:
+        return "กรุณากรอกชื่อเมนู"
+    if any(x["name"].casefold() == name.casefold() for x in state()["menus"]):
+        return "มีชื่อเมนูนี้ในคลังแล้ว"
+    state()["menus"].append(normalized_menu({"name":name,"category":category,"source":source,"url":url,"steps":steps,"status":status}))
+    return None
+
+
+def search_bing_rss(query):
+    # ผลลัพธ์ค้นหาสาธารณะ อาจถูกจำกัดโดยผู้ให้บริการ; ไม่ดึงสูตรเต็มอัตโนมัติ
+    response = requests.get("https://www.bing.com/search", params={"q":query + " สูตรอาหาร วิธีทำ", "format":"rss", "setlang":"th-TH"}, timeout=9,
+                            headers={"User-Agent":"Mozilla/5.0 (compatible; Khaokaeng40/2.0)"})
+    response.raise_for_status()
+    root = ET.fromstring(response.content)
+    items = []
+    for item in root.findall("./channel/item")[:12]:
+        title = (item.findtext("title") or "").strip()
+        link = clean_url(item.findtext("link") or "")
+        if title and link:
+            items.append({"title":title,"url":link})
+    return items
+
+
+store = state()
+menus = store["menus"]
+plan = store["plan"]
+st.title("🍛 ข้าวแกง 40")
+st.caption("V2 • Run เมนูรายวัน 3–5 อย่าง • คลังสูตรภายนอก • ยังไม่คำนวณต้นทุน")
+st.info("ข้อมูลบันทึกชั่วคราวในเซสชัน Streamlit เท่านั้น โปรดดาวน์โหลดสำรอง JSON ทุกครั้งหลังแก้ไขสำคัญ ก่อนปิดหรือรีสตาร์ตแอป")
+with st.expander("💾 สำรอง / นำเข้าข้อมูล (รองรับ V1 และ V2)"):
+    st.download_button("⬇️ ดาวน์โหลดข้อมูลทั้งหมด (เมนู + ตาราง)", export_json(), file_name=f"khaokaeng40_v2_{date.today().isoformat()}.json", mime="application/json")
+    uploaded = st.file_uploader("นำเข้า JSON จาก V1 หรือ V2", type=["json"])
+    if uploaded and st.button("ยืนยันนำเข้า (แทนที่ข้อมูลปัจจุบัน)"):
         try:
-            obj = json.load(uploaded)
-            if not isinstance(obj,list) or any(not isinstance(x,dict) or 'name' not in x for x in obj):
-                raise ValueError('รูปแบบไฟล์ไม่ถูกต้อง')
-            st.session_state.menus = obj
-            st.success('นำเข้าข้อมูลแล้ว')
+            if uploaded.size > 3_000_000:
+                raise ValueError("ไฟล์ใหญ่เกิน 3 MB")
+            st.session_state.store = migrate(json.loads(uploaded.getvalue().decode("utf-8")))
+            st.success("นำเข้าข้อมูลแล้ว")
             st.rerun()
-        except (ValueError, json.JSONDecodeError) as e: st.error(str(e))
+        except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            st.error(f"นำเข้าไม่สำเร็จ: {exc}")
 
-tab1, tab2, tab3 = st.tabs(['📅 เมนูวันนี้','📖 คลังสูตร','💰 ต้นทุน'])
-with tab1:
-    st.subheader(f'วางแผนเมนูวันที่ {date.today().strftime("%d/%m/%Y")}')
-    choices = st.multiselect('เลือก 3–5 เมนู', [m['name'] for m in menus], default=[m['name'] for m in menus[:min(5,len(menus))]])
-    if not 3 <= len(choices) <= 5: st.warning('แนะนำให้เลือก 3–5 เมนูต่อวัน')
-    for i, name in enumerate(choices,1): st.write(f'{i}. {name}')
-    st.caption('เวอร์ชันนี้เป็นแผนเมนูชั่วคราว ยังไม่บันทึกตารางรายวันแบบถาวร')
-with tab2:
-    names = [m['name'] for m in menus]
-    choice = st.selectbox('เลือกสูตร',names) if names else None
-    if choice:
-        m = next(x for x in menus if x['name']==choice)
-        st.write('ประเภท:',m.get('category','-'))
-        st.write('ที่มา:',m.get('source','-'))
-        if m.get('url'): st.link_button('เปิดแหล่งสูตร',m['url'])
-        with st.form('edit_recipe'):
-            category=st.selectbox('ประเภท', ['ผัด','ต้ม','แกง','ยำ','ทอด','อื่น ๆ'],index=['ผัด','ต้ม','แกง','ยำ','ทอด','อื่น ๆ'].index(m.get('category','อื่น ๆ')) if m.get('category') in ['ผัด','ต้ม','แกง','ยำ','ทอด','อื่น ๆ'] else 5)
-            steps=st.text_area('ขั้นตอนทำอาหาร',value=m.get('steps',''))
-            source=st.text_input('แหล่งสูตร / ชื่อช่อง',value=m.get('source',''))
-            url=st.text_input('ลิงก์สูตร (ถ้ามี)',value=m.get('url',''))
-            if st.form_submit_button('บันทึกสูตร'):
-                m.update(category=category,steps=steps,source=source,url=url)
-                st.success('บันทึกในเซสชันแล้ว อย่าลืมสำรองข้อมูล')
-        st.markdown('**วัตถุดิบและต้นทุนสำหรับสูตรนี้**')
-        for idx, ing in enumerate(m.get('ingredients',[])):
-            st.write(f"• {ing['name']}: {ing['quantity']} {ing['unit']} × {money(ing['unit_cost'])}/{ing['unit']}")
-        with st.form('add_ingredient',clear_on_submit=True):
-            item=st.text_input('ชื่อวัตถุดิบ')
-            c1,c2,c3=st.columns(3)
-            with c1: qty=st.number_input('ปริมาณที่ใช้',min_value=0.01,value=1.0,step=0.5)
-            with c2: unit=st.selectbox('หน่วย',['กรัม','กก.','ฟอง','มล.','ลิตร','ชิ้น','บาท'])
-            with c3: unit_cost=st.number_input('ราคา/หน่วย (บาท)',min_value=0.0,value=0.0,step=1.0)
-            if st.form_submit_button('เพิ่มวัตถุดิบ'):
-                if item.strip():
-                    m.setdefault('ingredients',[]).append({'name':item.strip(),'quantity':qty,'unit':unit,'unit_cost':unit_cost})
+t1, t2, t3 = st.tabs(["📅 Run เมนู", "📚 คลังเมนู", "🔎 ค้นหาภายนอก"])
+with t1:
+    st.subheader("วางแผนเมนู 7–30 วัน")
+    start = st.date_input("เริ่มวันที่", value=date.today(), key="start_date")
+    days = st.slider("วางแผนกี่วัน", min_value=7, max_value=30, value=7)
+    per_day = st.select_slider("เมนูต่อวัน", options=[3,4,5], value=4)
+    candidates = [m for m in menus if m["status"] != "พักไว้"]
+    if len(candidates) < per_day:
+        st.warning(f"มีเมนูพร้อมใช้ {len(candidates)} อย่าง ต้องมีอย่างน้อย {per_day} อย่างก่อนสร้างตาราง")
+    seed = st.number_input("หมายเลขชุดสุ่ม (เปลี่ยนเลขเพื่อเปลี่ยนตาราง)", min_value=0, max_value=99999, value=40)
+    if st.button("🔄 สร้างตารางหมุนเวียน", type="primary", disabled=len(candidates)<per_day):
+        rng = random.Random(int(seed))
+        history = []
+        for offset in range(days):
+            key = (start + timedelta(days=offset)).isoformat()
+            chosen = []
+            pool = [m["name"] for m in candidates]
+            for _ in range(per_day):
+                weights = [1 if n in history[-per_day:] else (3 if n in history[-per_day*2:] else 10) for n in pool]
+                picked = rng.choices(pool, weights=weights, k=1)[0]
+                chosen.append(picked)
+                pool.remove(picked)
+            plan[key] = chosen
+            history.extend(chosen)
+        st.success("สร้างตารางแล้ว สามารถแก้ไขแต่ละวันด้านล่าง")
+    st.caption("การสร้างตารางใหม่จะเขียนทับแผนในช่วงวันที่เลือก ไม่กระทบวันอื่น ระบบพยายามลดการซ้ำแต่ไม่รับประกันเมื่อมีเมนูน้อย")
+    names = [m["name"] for m in candidates]
+    for offset in range(days):
+        d = start + timedelta(days=offset)
+        key = d.isoformat()
+        with st.expander(f"{d.strftime('%d/%m/%Y')}  •  {', '.join(plan.get(key, [])) or 'ยังไม่จัดเมนู'}", expanded=(offset==0)):
+            current = [x for x in plan.get(key, []) if x in names]
+            chosen = st.multiselect("เลือกหรือแก้เมนู 3–5 อย่าง", names, default=current, key=f"pick_{key}")
+            if st.button("บันทึกวันนี้", key=f"save_{key}"):
+                if 3 <= len(chosen) <= 5:
+                    plan[key] = chosen
+                    st.success("บันทึกในเซสชันแล้ว")
                     st.rerun()
-                else: st.error('กรุณาระบุชื่อวัตถุดิบ')
-        if m.get('ingredients'):
-            if st.button('ล้างรายการวัตถุดิบของสูตรนี้'):
-                m['ingredients']=[];st.rerun()
+                else:
+                    st.error("ต้องเลือก 3–5 เมนู")
+    st.download_button("⬇️ ดาวน์โหลดตาราง CSV", "วันที่,เมนู\n" + "\n".join(f'{(start+timedelta(days=i)).isoformat()},"{ " / ".join(plan.get((start+timedelta(days=i)).isoformat(), [])).replace(chr(34), chr(34)*2) }"' for i in range(days)), file_name="menu_plan.csv", mime="text/csv")
+
+with t2:
+    st.subheader("คลังเมนูของร้านและเมนูทดลอง")
+    filter_status = st.selectbox("กรองสถานะ", ["ทั้งหมด"] + STATUSES)
+    for m in menus:
+        if filter_status != "ทั้งหมด" and m["status"] != filter_status:
+            continue
+        with st.expander(f"{m['name']}  •  {m['status']}"):
+            st.write(f"ประเภท: {m['category']} | ที่มา: {m['source']}")
+            if m["url"]:
+                st.link_button("เปิดสูตรต้นฉบับ", m["url"])
+            with st.form("edit_"+str(menus.index(m))):
+                category = st.selectbox("ประเภท", CATEGORIES, index=CATEGORIES.index(m["category"]) if m["category"] in CATEGORIES else len(CATEGORIES)-1)
+                status = st.selectbox("สถานะ", STATUSES, index=STATUSES.index(m["status"]))
+                source = st.text_input("ชื่อแหล่งสูตร / ช่อง", value=m["source"])
+                url = st.text_input("ลิงก์สูตร", value=m["url"])
+                steps = st.text_area("โน้ตหรือขั้นตอนทำ", value=m["steps"])
+                if st.form_submit_button("บันทึกการแก้ไข"):
+                    if url.strip() and not clean_url(url):
+                        st.error("ลิงก์ต้องขึ้นต้นด้วย https:// หรือ http://")
+                    else:
+                        m.update(category=category,status=status,source=source,url=clean_url(url),steps=steps)
+                        st.success("บันทึกในเซสชันแล้ว")
+                        st.rerun()
     st.divider()
-    with st.form('new_recipe'):
-        st.markdown('**เพิ่มเมนูใหม่จากร้านหรือแหล่งภายนอก**')
-        newname=st.text_input('ชื่อเมนูใหม่')
-        newsource=st.text_input('แหล่งที่มา',value='สูตรจากภายนอก')
-        newurl=st.text_input('URL สูตร เช่น YouTube / เว็บไซต์')
-        if st.form_submit_button('เพิ่มเมนู'):
-            if not newname.strip(): st.error('กรุณากรอกชื่อเมนู')
-            elif newname.strip() in names: st.error('ชื่อเมนูนี้มีแล้ว')
+    st.subheader("เพิ่มเมนูจากลิงก์เอง")
+    with st.form("new_menu", clear_on_submit=True):
+        name = st.text_input("ชื่ออาหาร *")
+        category = st.selectbox("ประเภท", CATEGORIES)
+        source = st.text_input("แหล่งที่มา เช่น YouTube / TikTok / เว็บไซต์")
+        url = st.text_input("ลิงก์ต้นฉบับ (ไม่บังคับ)")
+        steps = st.text_area("โน้ตสูตรหรือวิธีทำ")
+        status = st.selectbox("สถานะ", STATUSES, index=1)
+        if st.form_submit_button("➕ เพิ่มเข้าคลัง"):
+            if url.strip() and not clean_url(url):
+                st.error("ลิงก์ต้องขึ้นต้นด้วย https:// หรือ http://")
             else:
-                menus.append({'name':newname.strip(),'category':'อื่น ๆ','ingredients':[],'steps':'','source':newsource,'url':newurl})
-                st.rerun()
-    st.link_button('ค้นหาไอเดียสูตรอาหารบน Google','https://www.google.com/search?q=สูตรอาหารไทย+ข้าวแกง')
-with tab3:
-    if not menus: st.warning('กรุณาเพิ่มเมนูก่อน')
-    else:
-        selected=st.selectbox('เมนูที่ต้องการคำนวณ',[m['name'] for m in menus],key='costmenu')
-        m=next(x for x in menus if x['name']==selected)
-        ingredients=m.get('ingredients',[])
-        ingredient_total=sum(float(x['quantity'])*float(x['unit_cost']) for x in ingredients)
-        st.write('ต้นทุนวัตถุดิบทั้งสูตร:',money(ingredient_total))
-        portions=st.number_input('สูตรนี้แบ่งขายได้กี่ถุง/ส่วน',min_value=1,value=20,step=1)
-        packaging=st.number_input('ค่าถุง/บรรจุภัณฑ์ต่อถุง (บาท)',min_value=0.0,value=0.0,step=0.5)
-        rice=st.number_input('ต้นทุนข้าวต่อจาน (บาท)',min_value=0.0,value=0.0,step=0.5)
-        platepack=st.number_input('ต้นทุนกล่อง/ภาชนะต่อจาน (บาท)',min_value=0.0,value=0.0,step=0.5)
-        selling=st.number_input('ราคาขายต่อหน่วย (ไม่เกิน 40 บาท)',min_value=1.0,max_value=40.0,value=40.0,step=1.0)
-        per=ingredient_total/portions
-        a=per+packaging;b=per+rice+platepack
-        st.metric('ต้นทุนต่อถุง',money(a),delta=f'ส่วนต่าง {money(selling-a)}',delta_color='normal')
-        st.metric('ต้นทุนต่อจานราดข้าว',money(b),delta=f'ส่วนต่าง {money(selling-b)}',delta_color='normal')
-        if not ingredients: st.warning('ยังไม่มีข้อมูลวัตถุดิบ ผลลัพธ์จึงยังไม่ใช่ต้นทุนจริง')
-        st.caption('ส่วนต่างยังไม่ใช่กำไรสุทธิ: ไม่รวมค่าแก๊ส ค่าแรง ค่าเช่า อาหารเหลือ และค่าใช้จ่ายอื่นที่ไม่ได้บันทึก')
+                error = add_menu(name,category,source or "เพิ่มเอง",url,steps,status)
+                if error: st.error(error)
+                else:
+                    st.success("เพิ่มเมนูแล้ว")
+                    st.rerun()
+
+with t3:
+    st.subheader("ค้นหาเมนูและสูตรจากอินเทอร์เน็ต")
+    st.caption("ค้นหาผ่านผลลัพธ์สาธารณะของ Bing RSS เมื่อเข้าถึงได้ และเปิดต้นฉบับก่อนนำสูตรไปใช้ ข้อมูลสูตรเต็มไม่ได้ถูกดึงอัตโนมัติ")
+    q = st.text_input("ค้นหา เช่น แกงไก่ ผัดผัก เมนูข้าวแกง", value="เมนูข้าวแกง")
+    if st.button("🔎 ค้นหาออนไลน์"):
+        if not q.strip():
+            st.warning("กรอกคำค้นก่อน")
+        else:
+            with st.spinner("กำลังค้นหา..."):
+                try:
+                    st.session_state.results = search_bing_rss(q.strip())
+                    if not st.session_state.results:
+                        st.warning("ยังไม่พบผลลัพธ์ ลองคำค้นอื่นหรือเปิด Google ด้านล่าง")
+                except (requests.RequestException, ET.ParseError, ValueError):
+                    st.session_state.results = []
+                    st.warning("บริการค้นหาอัตโนมัติไม่ตอบกลับในขณะนี้ ใช้ปุ่มค้นหาผ่านเว็บแทนได้")
+    st.link_button("เปิด Google เพื่อค้นสูตร", "https://www.google.com/search?q=" + quote((q or "สูตรอาหารไทย") + " สูตรอาหาร"))
+    st.link_button("เปิด YouTube เพื่อค้นสูตร", "https://www.youtube.com/results?search_query=" + quote((q or "อาหารไทย") + " วิธีทำ"))
+    results = st.session_state.get("results", [])
+    for i, result in enumerate(results):
+        with st.container(border=True):
+            st.write(f"**{result['title']}**")
+            st.link_button("อ่านแหล่งต้นฉบับ", result["url"])
+            if st.button("เก็บลิงก์เข้าคลัง", key=f"result_{i}"):
+                error = add_menu(result["title"][:120], "อื่น ๆ", "ค้นหาออนไลน์ (ตรวจสอบสูตรก่อน)", result["url"], "", "รอทดลอง")
+                if error: st.warning(error)
+                else: st.success("เก็บลิงก์แล้ว ไปแก้ชื่อและรายละเอียดได้ในคลังเมนู")
+    st.caption("หมายเหตุ: ผลค้นหาอาจไม่ใช่สูตรอาหารทั้งหมด และการบันทึกผลค้นหาเป็นเพียงการเก็บลิงก์ ไม่ได้ยืนยันต้นทุนหรือความเหมาะสมสำหรับขาย")
